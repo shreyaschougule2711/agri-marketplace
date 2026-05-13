@@ -1,4 +1,4 @@
-const API = `http://${window.location.hostname}:5000/api`;
+const API = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '/api' : `http://${window.location.hostname}:5000/api`);
 
 function getHeaders() {
   const token = localStorage.getItem('token');

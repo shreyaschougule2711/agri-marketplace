@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: agriconnect-fullstack
+    env: node
+    buildCommand: "npm install --prefix server && npm install --prefix client && npm run build --prefix client"
+    startCommand: "npm start --prefix server"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /data/agriconnect.db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE
+        value: 7d
+      - key: AGMARKNET_API_KEY
+        sync: false # You must set this manually in the Render Dashboard
+    disk:
+      name: agriconnect-data
+      mountPath: /data
+      sizeGB: 1
