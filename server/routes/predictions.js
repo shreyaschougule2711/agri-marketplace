@@ -3,12 +3,30 @@ const { db } = require('../services/database');
 const { protect } = require('../middleware/auth');
 const router = express.Router();
 
-// ──── PREDICTION ENGINE (uses actual DB price history) ────
+// ──── PREDICTION ENGINE ────
 
-function predict(cropName) {
+async function predict(cropName) {
   // Fetch real price history from database
-  const history = db.prepare('SELECT * FROM price_history WHERE cropName = ? ORDER BY recordedAt ASC').all(cropName);
-  const latestMarket = db.prepare('SELECT * FROM market_prices WHERE cropName = ? ORDER BY updatedAt DESC LIMIT 1').get(cropName);
+  const historySnap = await db.collection('price_history').where('cropName', '==', cropName).get();
+  let history = historySnap.docs.map(doc => doc.data());
+  // Sort in JS to avoid composite index requirement
+  history.sort((a, b) => {
+    const timeA = a.recordedAt && a.recordedAt.toDate ? a.recordedAt.toDate().getTime() : new Date(a.recordedAt || 0).getTime();
+    const timeB = b.recordedAt && b.recordedAt.toDate ? b.recordedAt.toDate().getTime() : new Date(b.recordedAt || 0).getTime();
+    return timeA - timeB;
+  });
+
+  const marketSnap = await db.collection('market_prices').where('cropName', '==', cropName).get();
+  let latestMarket = null;
+  let latestTime = -1;
+  marketSnap.forEach(doc => {
+    const data = doc.data();
+    const t = data.updatedAt && data.updatedAt.toDate ? data.updatedAt.toDate().getTime() : new Date(data.updatedAt || 0).getTime();
+    if (t > latestTime) {
+      latestTime = t;
+      latestMarket = data;
+    }
+  });
 
   const currentPrice = latestMarket?.price || (history.length > 0 ? history[history.length - 1].price : null);
 
@@ -16,13 +34,11 @@ function predict(cropName) {
     return { crop: cropName, noData: true, message: `No price data available for ${cropName}. Ask admin to add market prices first.` };
   }
 
-  // Build historical price series
   const historicalPrices = history.map(h => ({
-    date: h.recordedAt,
+    date: h.recordedAt && h.recordedAt.toDate ? h.recordedAt.toDate().toISOString() : h.recordedAt,
     price: h.price
   }));
 
-  // If not enough history, generate from current price with slight variation for trend display
   if (historicalPrices.length < 5) {
     for (let i = 30; i > historicalPrices.length; i--) {
       const d = new Date();
@@ -32,11 +48,9 @@ function predict(cropName) {
     }
   }
 
-  // Simple Moving Average prediction
   const recentPrices = historicalPrices.slice(-10).map(h => h.price);
   const sma = recentPrices.reduce((a, b) => a + b, 0) / recentPrices.length;
 
-  // Calculate trend (linear regression slope on last entries)
   const n = recentPrices.length;
   let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
   for (let i = 0; i < n; i++) {
@@ -44,7 +58,6 @@ function predict(cropName) {
   }
   const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX) || 0;
 
-  // Forecast next 14 days
   const forecastPrices = [];
   for (let i = 1; i <= 14; i++) {
     const d = new Date();
@@ -62,11 +75,13 @@ function predict(cropName) {
   const predicted7d = forecastPrices[6]?.price || sma;
   const change = ((predicted7d - currentPrice) / currentPrice * 100);
 
-  // Count available crop quantity on platform
-  const supply = db.prepare("SELECT COALESCE(SUM(quantity),0) as total FROM crops WHERE cropName = ? AND status = 'available'").get(cropName).total;
-  const buyerInterest = db.prepare("SELECT COUNT(*) as c FROM orders WHERE cropName = ?").get(cropName).c;
+  const supplySnap = await db.collection('crops').where('cropName', '==', cropName).where('status', '==', 'available').get();
+  let supply = 0;
+  supplySnap.forEach(d => supply += d.data().quantity || 0);
 
-  // Demand score based on actual platform activity
+  const buyerInterestSnap = await db.collection('orders').where('cropName', '==', cropName).get();
+  const buyerInterest = buyerInterestSnap.size;
+
   const demandScore = Math.min(100, Math.max(0, Math.round(30 + buyerInterest * 15 - supply * 0.02 + Math.abs(change) * 2)));
 
   return {
@@ -90,95 +105,106 @@ function predict(cropName) {
   };
 }
 
-// GET /api/predictions/price/:crop
-router.get('/price/:crop', (req, res) => {
-  const prediction = predict(req.params.crop);
-  res.json({ success: true, prediction });
+router.get('/price/:crop', async (req, res) => {
+  try {
+    const prediction = await predict(req.params.crop);
+    res.json({ success: true, prediction });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// GET /api/predictions/demand
-router.get('/demand', (req, res) => {
-  // Get all unique crop names that have either market prices or listings
-  const cropNames = db.prepare(`
-    SELECT DISTINCT cropName FROM (
-      SELECT cropName FROM market_prices
-      UNION
-      SELECT cropName FROM crops WHERE status = 'available'
-    )
-  `).all().map(r => r.cropName);
+router.get('/demand', async (req, res) => {
+  try {
+    const cropNamesSet = new Set();
+    const mpSnap = await db.collection('market_prices').get();
+    mpSnap.forEach(d => cropNamesSet.add(d.data().cropName));
+    const cropSnap = await db.collection('crops').where('status', '==', 'available').get();
+    cropSnap.forEach(d => cropNamesSet.add(d.data().cropName));
 
-  if (cropNames.length === 0) {
-    return res.json({ success: true, forecasts: [], message: 'No crop data yet. Add market prices or crop listings first.' });
-  }
+    const cropNames = Array.from(cropNamesSet);
 
-  const forecasts = cropNames.map(crop => {
-    const p = predict(crop);
-    return {
-      crop: p.crop,
-      demandScore: p.demandScore || 0,
-      predictedPrice: p.predictedPrice || 0,
-      currentPrice: p.currentPrice || 0,
-      priceChange: p.priceChange || 0,
-      confidence: p.confidence || 0,
-      trend: p.trend || 'stable',
-      recommendation: p.recommendation || 'Add more data'
-    };
-  });
-  forecasts.sort((a, b) => b.demandScore - a.demandScore);
-  res.json({ success: true, forecasts });
+    if (cropNames.length === 0) {
+      return res.json({ success: true, forecasts: [], message: 'No crop data yet. Add market prices or crop listings first.' });
+    }
+
+    const forecasts = await Promise.all(cropNames.map(async crop => {
+      const p = await predict(crop);
+      return {
+        crop: p.crop,
+        demandScore: p.demandScore || 0,
+        predictedPrice: p.predictedPrice || 0,
+        currentPrice: p.currentPrice || 0,
+        priceChange: p.priceChange || 0,
+        confidence: p.confidence || 0,
+        trend: p.trend || 'stable',
+        recommendation: p.recommendation || 'Add more data'
+      };
+    }));
+
+    forecasts.sort((a, b) => b.demandScore - a.demandScore);
+    res.json({ success: true, forecasts });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// POST /api/predictions/voice-query — processes real text query
-router.post('/voice-query', protect, (req, res) => {
-  const { text, language } = req.body;
-  if (!text) return res.status(400).json({ success: false, message: 'No query text provided' });
+router.post('/voice-query', protect, async (req, res) => {
+  try {
+    const { text, language } = req.body;
+    if (!text) return res.status(400).json({ success: false, message: 'No query text provided' });
 
-  const lower = text.toLowerCase();
+    const lower = text.toLowerCase();
 
-  // Detect crop from query
-  const allCrops = db.prepare('SELECT DISTINCT cropName FROM market_prices UNION SELECT DISTINCT cropName FROM crops').all().map(r => r.cropName);
-  let detectedCrop = null;
-  for (const c of allCrops) {
-    if (lower.includes(c.toLowerCase())) { detectedCrop = c; break; }
-  }
+    const cropNamesSet = new Set();
+    const mpSnap = await db.collection('market_prices').get();
+    mpSnap.forEach(d => cropNamesSet.add(d.data().cropName));
+    const cropSnap = await db.collection('crops').get();
+    cropSnap.forEach(d => cropNamesSet.add(d.data().cropName));
+    const allCrops = Array.from(cropNamesSet);
 
-  let response = '';
-
-  if ((lower.includes('price') || lower.includes('rate') || lower.includes('cost') || lower.includes('keemat') || lower.includes('bhav')) && detectedCrop) {
-    const p = predict(detectedCrop);
-    if (p.noData) {
-      response = p.message;
-    } else {
-      response = `The current market price of ${detectedCrop} is ₹${p.currentPrice}/${p.unit || 'kg'}. Predicted price in 7 days: ₹${p.predictedPrice}/${p.unit || 'kg'} (${p.priceChange >= 0 ? '+' : ''}${p.priceChange}%). ${p.recommendation}.`;
+    let detectedCrop = null;
+    for (const c of allCrops) {
+      if (lower.includes(c.toLowerCase())) { detectedCrop = c; break; }
     }
-  } else if (lower.includes('demand') || lower.includes('forecast') || lower.includes('maang')) {
-    if (detectedCrop) {
-      const p = predict(detectedCrop);
-      response = p.noData ? p.message : `${detectedCrop} demand score: ${p.demandScore}%. ${p.recommendation}.`;
-    } else {
-      const top = db.prepare("SELECT cropName, price FROM market_prices ORDER BY price DESC LIMIT 3").all();
-      response = top.length > 0
-        ? `Top priced crops: ${top.map(t => `${t.cropName} (₹${t.price}/kg)`).join(', ')}. Check demand forecast page for detailed analysis.`
-        : 'No market data available yet. Ask your admin to update market prices.';
-    }
-  } else if (lower.includes('weather') || lower.includes('mausam')) {
-    response = 'For live weather updates, please check the dashboard weather widget. I can help with crop prices, demand, and selling. Try: "What is tomato price?"';
-  } else if (lower.includes('group') || lower.includes('sell')) {
-    const groups = db.prepare("SELECT COUNT(*) as c FROM groups_table WHERE status IN ('forming','active','negotiating')").get().c;
-    response = groups > 0 ? `There are ${groups} active selling groups on the platform. Visit Group Selling to join or create one.` : 'No selling groups yet. You can create one from the Group Selling page.';
-  } else if (lower.includes('help') || lower.includes('madad')) {
-    response = 'I can help with:\n• Crop prices → "What is rice price?"\n• Demand → "Show demand forecast"\n• Groups → "Any selling groups?"\n• Weather → "Today weather"\nTry asking about a specific crop!';
-  } else if (lower.includes('listing') || lower.includes('crop') || lower.includes('fasal')) {
-    const count = db.prepare("SELECT COUNT(*) as c FROM crops WHERE status = 'available'").get().c;
-    response = count > 0 ? `There are ${count} crop listings available on the marketplace right now. Browse Market Prices or Smart Matching to explore.` : 'No crop listings yet. Farmers can add crops from My Crops page.';
-  } else {
-    response = `I understood: "${text}". I can help with crop prices, demand forecasts, selling groups, and market insights. Try asking "What is the price of tomato?" or "Show demand forecast".`;
-  }
 
-  res.json({
-    success: true, query: text, language: language || 'en',
-    detectedCrop, response, timestamp: new Date().toISOString()
-  });
+    let response = '';
+
+    if ((lower.includes('price') || lower.includes('rate') || lower.includes('cost') || lower.includes('keemat') || lower.includes('bhav')) && detectedCrop) {
+      const p = await predict(detectedCrop);
+      if (p.noData) {
+        response = p.message;
+      } else {
+        response = `The current market price of ${detectedCrop} is ₹${p.currentPrice}/${p.unit || 'kg'}. Predicted price in 7 days: ₹${p.predictedPrice}/${p.unit || 'kg'} (${p.priceChange >= 0 ? '+' : ''}${p.priceChange}%). ${p.recommendation}.`;
+      }
+    } else if (lower.includes('demand') || lower.includes('forecast') || lower.includes('maang')) {
+      if (detectedCrop) {
+        const p = await predict(detectedCrop);
+        response = p.noData ? p.message : `${detectedCrop} demand score: ${p.demandScore}%. ${p.recommendation}.`;
+      } else {
+        const topSnap = await db.collection('market_prices').orderBy('price', 'desc').limit(3).get();
+        const top = topSnap.docs.map(d => d.data());
+        response = top.length > 0
+          ? `Top priced crops: ${top.map(t => `${t.cropName} (₹${t.price}/kg)`).join(', ')}. Check demand forecast page for detailed analysis.`
+          : 'No market data available yet. Ask your admin to update market prices.';
+      }
+    } else if (lower.includes('weather') || lower.includes('mausam')) {
+      response = 'For live weather updates, please check the dashboard weather widget. I can help with crop prices, demand, and selling. Try: "What is tomato price?"';
+    } else if (lower.includes('group') || lower.includes('sell')) {
+      const gSnap = await db.collection('groups_table').where('status', 'in', ['forming','active','negotiating']).count().get();
+      const groups = gSnap.data().count;
+      response = groups > 0 ? `There are ${groups} active selling groups on the platform. Visit Group Selling to join or create one.` : 'No selling groups yet. You can create one from the Group Selling page.';
+    } else if (lower.includes('help') || lower.includes('madad')) {
+      response = 'I can help with:\n• Crop prices → "What is rice price?"\n• Demand → "Show demand forecast"\n• Groups → "Any selling groups?"\n• Weather → "Today weather"\nTry asking about a specific crop!';
+    } else if (lower.includes('listing') || lower.includes('crop') || lower.includes('fasal')) {
+      const cSnap = await db.collection('crops').where('status', '==', 'available').count().get();
+      const count = cSnap.data().count;
+      response = count > 0 ? `There are ${count} crop listings available on the marketplace right now. Browse Market Prices or Smart Matching to explore.` : 'No crop listings yet. Farmers can add crops from My Crops page.';
+    } else {
+      response = `I understood: "${text}". I can help with crop prices, demand forecasts, selling groups, and market insights. Try asking "What is the price of tomato?" or "Show demand forecast".`;
+    }
+
+    res.json({
+      success: true, query: text, language: language || 'en',
+      detectedCrop, response, timestamp: new Date().toISOString()
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 module.exports = router;

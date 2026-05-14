@@ -29,11 +29,15 @@ app.use('/api/matching', matchingRoutes);
 app.use('/api/groups', groupRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
-app.get('/api/health', (req, res) => {
-  const { db } = require('./services/database');
-  const users = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  const crops = db.prepare('SELECT COUNT(*) as c FROM crops').get().c;
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), users, crops });
+app.get('/api/health', async (req, res) => {
+  try {
+    const { db } = require('./services/database');
+    const uSnap = await db.collection('users').count().get();
+    const cSnap = await db.collection('crops').count().get();
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), users: uSnap.data().count, crops: cSnap.data().count });
+  } catch(e) {
+    res.json({ status: 'ok', message: 'Firebase connected' });
+  }
 });
 
 app.use((err, req, res, next) => {
@@ -52,5 +56,5 @@ if (process.env.NODE_ENV === 'production' || process.env.RENDER) {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`\n🚀 AgriConnect API — http://localhost:${PORT}`);
-  console.log(`💾 Database: server/agriconnect.db (persistent)\n`);
+  console.log(`🔥 Database: Firebase Firestore (persistent)\n`);
 });

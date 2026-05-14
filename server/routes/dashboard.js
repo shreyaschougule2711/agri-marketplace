@@ -3,39 +3,96 @@ const { db } = require('../services/database');
 const { protect } = require('../middleware/auth');
 const router = express.Router();
 
-router.get('/stats', protect, (req, res) => {
-  const totalFarmers = db.prepare("SELECT COUNT(*) as c FROM users WHERE role='farmer'").get().c;
-  const totalBuyers = db.prepare("SELECT COUNT(*) as c FROM users WHERE role='buyer'").get().c;
-  const activeCrops = db.prepare("SELECT COUNT(*) as c FROM crops WHERE status='available'").get().c;
-  const totalOrders = db.prepare("SELECT COUNT(*) as c FROM orders").get().c;
-  const revenue = db.prepare("SELECT COALESCE(SUM(totalAmount),0) as r FROM orders WHERE status != 'cancelled'").get().r;
-  const activeGroups = db.prepare("SELECT COUNT(*) as c FROM groups_table WHERE status IN ('forming','active','negotiating')").get().c;
-  const totalUsers = db.prepare("SELECT COUNT(*) as c FROM users").get().c;
-  const marketPriceCount = db.prepare("SELECT COUNT(*) as c FROM market_prices").get().c;
+router.get('/stats', protect, async (req, res) => {
+  try {
+    const totalFarmers = (await db.collection('users').where('role', '==', 'farmer').count().get()).data().count;
+    const totalBuyers = (await db.collection('users').where('role', '==', 'buyer').count().get()).data().count;
+    const activeCrops = (await db.collection('crops').where('status', '==', 'available').count().get()).data().count;
+    const totalOrders = (await db.collection('orders').count().get()).data().count;
+    const totalUsers = (await db.collection('users').count().get()).data().count;
+    const marketPriceCount = (await db.collection('market_prices').count().get()).data().count;
+    
+    // Revenue
+    const ordersSnap = await db.collection('orders').where('status', '!=', 'cancelled').get();
+    let revenue = 0;
+    ordersSnap.forEach(doc => { revenue += doc.data().totalAmount || 0; });
+    
+    // Active Groups
+    const groupsSnap = await db.collection('groups_table').where('status', 'in', ['forming','active','negotiating']).get();
+    const activeGroups = groupsSnap.size;
 
-  let myStats = {};
-  if (req.user.role === 'farmer') {
-    myStats.myListings = db.prepare("SELECT COUNT(*) as c FROM crops WHERE farmerId=?").get(req.user.id).c;
-    myStats.myActiveListings = db.prepare("SELECT COUNT(*) as c FROM crops WHERE farmerId=? AND status='available'").get(req.user.id).c;
-    myStats.myRevenue = db.prepare("SELECT COALESCE(SUM(totalAmount),0) as r FROM orders WHERE farmerId=? AND status != 'cancelled'").get(req.user.id).r;
-    myStats.myOrders = db.prepare("SELECT COUNT(*) as c FROM orders WHERE farmerId=?").get(req.user.id).c;
-    myStats.myGroups = db.prepare("SELECT COUNT(*) as c FROM group_members WHERE userId=?").get(req.user.id).c;
-    myStats.pendingOrders = db.prepare("SELECT COUNT(*) as c FROM orders WHERE farmerId=? AND status='pending'").get(req.user.id).c;
-  }
-  if (req.user.role === 'buyer') {
-    myStats.myOrders = db.prepare("SELECT COUNT(*) as c FROM orders WHERE buyerId=?").get(req.user.id).c;
-    myStats.mySpent = db.prepare("SELECT COALESCE(SUM(totalAmount),0) as r FROM orders WHERE buyerId=? AND status != 'cancelled'").get(req.user.id).r;
-    myStats.pendingOrders = db.prepare("SELECT COUNT(*) as c FROM orders WHERE buyerId=? AND status='pending'").get(req.user.id).c;
-  }
+    let myStats = {};
+    if (req.user.role === 'farmer') {
+      myStats.myListings = (await db.collection('crops').where('farmerId', '==', req.user.id).count().get()).data().count;
+      myStats.myActiveListings = (await db.collection('crops').where('farmerId', '==', req.user.id).where('status', '==', 'available').count().get()).data().count;
+      
+      const myOrdersSnap = await db.collection('orders').where('farmerId', '==', req.user.id).get();
+      myStats.myOrders = myOrdersSnap.size;
+      myStats.myRevenue = 0;
+      myStats.pendingOrders = 0;
+      myOrdersSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.status !== 'cancelled') myStats.myRevenue += d.totalAmount || 0;
+        if (d.status === 'pending') myStats.pendingOrders++;
+      });
+      
+      myStats.myGroups = (await db.collection('group_members').where('userId', '==', req.user.id).count().get()).data().count;
+    }
+    if (req.user.role === 'buyer') {
+      const myOrdersSnap = await db.collection('orders').where('buyerId', '==', req.user.id).get();
+      myStats.myOrders = myOrdersSnap.size;
+      myStats.mySpent = 0;
+      myStats.pendingOrders = 0;
+      myOrdersSnap.forEach(doc => {
+        const d = doc.data();
+        if (d.status !== 'cancelled') myStats.mySpent += d.totalAmount || 0;
+        if (d.status === 'pending') myStats.pendingOrders++;
+      });
+    }
 
-  const topCrops = db.prepare("SELECT cropName, COUNT(*) as listings, SUM(quantity) as volume FROM crops GROUP BY cropName ORDER BY volume DESC LIMIT 5").all();
-  const recentOrders = db.prepare("SELECT o.*, f.name as farmerName, b.name as buyerName FROM orders o JOIN users f ON o.farmerId = f.id JOIN users b ON o.buyerId = b.id ORDER BY o.createdAt DESC LIMIT 10").all();
-  const recentUsers = db.prepare("SELECT name, role, createdAt FROM users ORDER BY createdAt DESC LIMIT 5").all();
+    // Top crops aggregation
+    const allCropsSnap = await db.collection('crops').get();
+    const cropStats = {};
+    allCropsSnap.forEach(doc => {
+      const d = doc.data();
+      if (!cropStats[d.cropName]) cropStats[d.cropName] = { listings: 0, volume: 0 };
+      cropStats[d.cropName].listings++;
+      cropStats[d.cropName].volume += d.quantity || 0;
+    });
+    const topCrops = Object.keys(cropStats).map(name => ({
+      cropName: name, ...cropStats[name]
+    })).sort((a, b) => b.volume - a.volume).slice(0, 5);
 
-  res.json({
-    success: true,
-    stats: { totalFarmers, totalBuyers, totalUsers, activeCrops, totalOrders, revenue, activeGroups, marketPriceCount, topCrops, recentOrders, recentUsers, ...myStats }
-  });
+    // Recent orders
+    const recentOrdersSnap = await db.collection('orders').orderBy('createdAt', 'desc').limit(10).get();
+    const recentOrders = await Promise.all(recentOrdersSnap.docs.map(async doc => {
+      const d = doc.data();
+      let farmerName, buyerName;
+      if (d.farmerId) {
+        const fDoc = await db.collection('users').doc(d.farmerId).get();
+        if (fDoc.exists) farmerName = fDoc.data().name;
+      }
+      if (d.buyerId) {
+        const bDoc = await db.collection('users').doc(d.buyerId).get();
+        if (bDoc.exists) buyerName = bDoc.data().name;
+      }
+      const createdAt = d.createdAt && d.createdAt.toDate ? d.createdAt.toDate().toISOString() : d.createdAt;
+      return { id: doc.id, ...d, createdAt, farmerName, buyerName };
+    }));
+
+    // Recent users
+    const recentUsersSnap = await db.collection('users').orderBy('createdAt', 'desc').limit(5).get();
+    const recentUsers = recentUsersSnap.docs.map(doc => {
+      const d = doc.data();
+      const createdAt = d.createdAt && d.createdAt.toDate ? d.createdAt.toDate().toISOString() : d.createdAt;
+      return { name: d.name, role: d.role, createdAt };
+    });
+
+    res.json({
+      success: true,
+      stats: { totalFarmers, totalBuyers, totalUsers, activeCrops, totalOrders, revenue, activeGroups, marketPriceCount, topCrops, recentOrders, recentUsers, ...myStats }
+    });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
 module.exports = router;
