@@ -4,9 +4,16 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'agriconnect.db');
-const dbDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-const db = new Database(DB_PATH);
+let actualDbPath = DB_PATH;
+try {
+  const dbDir = path.dirname(actualDbPath);
+  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+} catch (err) {
+  console.warn(`⚠️ Could not create directory for DB at ${actualDbPath}: ${err.message}`);
+  console.warn(`⚠️ Falling back to local database. (Did you forget to add the Disk in Render?)`);
+  actualDbPath = path.join(__dirname, '..', 'agriconnect.db');
+}
+const db = new Database(actualDbPath);
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
