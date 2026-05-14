@@ -3,7 +3,7 @@ services:
     name: agriconnect-fullstack
     env: node
 
-    buildCommand: "npm install --prefix server && npm install --prefix client && npm run build --prefix client"
+    buildCommand: "npm install --prefix server && npm install --include=dev --prefix client && npm run build --prefix client"
 
     startCommand: "npm start --prefix server"
 
